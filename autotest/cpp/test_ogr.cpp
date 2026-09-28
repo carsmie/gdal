@@ -4837,4 +4837,81 @@ TEST_F(test_ogr, GEOSProgress)
 #endif
 }
 
+// Test OGRLayer spatial filtering with a rectangle filter, in cases where
+// the geometry has no vertex inside the rectangle.
+TEST_F(test_ogr, spatial_filter_rectangle)
+{
+    // Without GEOS, any envelope intersection is accepted
+    if (!OGRGeometryFactory::haveGEOS())
+        GTEST_SKIP() << "GEOS missing";
+
+    const struct
+    {
+        const char *pszWKT;
+        double dfMinX, dfMinY, dfMaxX, dfMaxY;
+        bool bExpected;
+    } asCases[] = {
+        // Rectangle inside a polygon
+        {"POLYGON ((-10 -10,20 -10,20 20,-10 20,-10 -10))", 0, 0, 10, 10, true},
+        // Rectangle inside the hole of a polygon
+        {"POLYGON ((-10 -10,20 -10,20 20,-10 20,-10 -10),"
+         "(-5 -5,15 -5,15 15,-5 15,-5 -5))",
+         0, 0, 10, 10, false},
+        // Rectangle between the exterior ring and the hole
+        {"POLYGON ((-10 -10,20 -10,20 20,-10 20,-10 -10),"
+         "(-5 -5,15 -5,15 15,-5 15,-5 -5))",
+         -8, -8, -6, -6, true},
+        // Line crossing the rectangle
+        {"LINESTRING (-5 5,15 5)", 0, 0, 10, 10, true},
+        // Line whose envelope intersects the rectangle, but not the line
+        {"LINESTRING (5 25,25 5)", 0, 0, 10, 10, false},
+        // Line touching a corner of the rectangle
+        {"LINESTRING (0 20,20 0)", 0, 0, 10, 10, true},
+        // Line touching an edge of the rectangle
+        {"LINESTRING (-5 10,15 10)", 0, 0, 10, 10, true},
+        // Polygon whose envelope intersects the rectangle, but not the
+        // polygon
+        {"POLYGON ((5 25,25 5,25 25,5 25))", 0, 0, 10, 10, false},
+        // Multipolygons whose envelope contains the rectangle, as with
+        // geometries crossing the antimeridian
+        {"MULTIPOLYGON (((-20 -20,-15 -20,-15 -15,-20 -20)),"
+         "((15 15,20 15,20 20,15 15)))",
+         0, 0, 10, 10, false},
+        {"MULTIPOLYGON (((-20 -20,-15 -20,-15 -15,-20 -20)),"
+         "((-5 -5,15 -5,15 15,-5 15,-5 -5)))",
+         0, 0, 10, 10, true},
+        {"MULTIPOINT ((-5 5),(15 5))", 0, 0, 10, 10, false},
+        {"GEOMETRYCOLLECTION (POINT (-5 5),LINESTRING (-5 5,15 5))", 0, 0, 10,
+         10, true},
+    };
+
+    for (const auto &sCase : asCases)
+    {
+        auto poDS = std::unique_ptr<GDALDataset>(
+            GetGDALDriverManager()->GetDriverByName("MEM")->Create(
+                "", 0, 0, 0, GDT_Unknown, nullptr));
+        auto poLayer = poDS->CreateLayer("test", nullptr, wkbUnknown);
+        auto [poGeom, eErr] = OGRGeometryFactory::createFromWkt(sCase.pszWKT);
+        ASSERT_EQ(eErr, OGRERR_NONE);
+        OGRFeature oFeature(poLayer->GetLayerDefn());
+        oFeature.SetGeometry(poGeom.get());
+        ASSERT_EQ(poLayer->CreateFeature(&oFeature), OGRERR_NONE);
+
+        poLayer->SetSpatialFilterRect(sCase.dfMinX, sCase.dfMinY, sCase.dfMaxX,
+                                      sCase.dfMaxY);
+        poLayer->ResetReading();
+        std::unique_ptr<OGRFeature> poFeature(poLayer->GetNextFeature());
+        EXPECT_EQ(poFeature != nullptr, sCase.bExpected) << sCase.pszWKT;
+
+        OGREnvelope sEnvelope;
+        sEnvelope.MinX = sCase.dfMinX;
+        sEnvelope.MinY = sCase.dfMinY;
+        sEnvelope.MaxX = sCase.dfMaxX;
+        sEnvelope.MaxY = sCase.dfMaxY;
+        const OGRPolygon oRect(sEnvelope);
+        EXPECT_EQ(oRect.Intersects(poGeom.get()), sCase.bExpected)
+            << sCase.pszWKT;
+    }
+}
+
 }  // namespace
