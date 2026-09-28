@@ -3925,34 +3925,184 @@ int OGRLayer::InstallFilter(const OGRGeometry *poFilter)
 //! @endcond
 
 /************************************************************************/
-/*                  DoesGeometryHavePointInEnvelope()                   */
+/*                   OGRGeometryIntersectsRectangle()                   */
 /************************************************************************/
 
-static bool DoesGeometryHavePointInEnvelope(const OGRGeometry *poGeometry,
-                                            const OGREnvelope &sEnvelope)
+namespace
 {
-    const OGRLineString *poLS = nullptr;
+enum class RectIntersection
+{
+    NO,
+    YES,
+    UNKNOWN,  // must be decided by GEOS
+};
 
+// Upper bound of the rounding error of Orientation(), following
+// J. R. Shewchuk's orient2d() "ccwerrboundA" (3 + 16 * eps) * eps, with some
+// margin.
+constexpr double ORIENTATION_ERROR_FACTOR =
+    4 * std::numeric_limits<double>::epsilon();
+
+// Returns the sign of the orientation of point (x, y) relative to the
+// oriented line (x0, y0) -> (x1, y1): 1 if on its left, -1 if on its right,
+// and 0 if the floating-point computation cannot determine it for sure.
+inline int Orientation(double x0, double y0, double x1, double y1, double x,
+                       double y)
+{
+    const double dfLeft = (x1 - x0) * (y - y0);
+    const double dfRight = (y1 - y0) * (x - x0);
+    const double dfDet = dfLeft - dfRight;
+    const double dfErrBound =
+        ORIENTATION_ERROR_FACTOR * (std::fabs(dfLeft) + std::fabs(dfRight));
+    if (dfDet > dfErrBound)
+        return 1;
+    if (dfDet < -dfErrBound)
+        return -1;
+    return 0;
+}
+
+inline bool IsPointInRectangle(double x, double y, const OGREnvelope &sRect)
+{
+    return x >= sRect.MinX && y >= sRect.MinY && x <= sRect.MaxX &&
+           y <= sRect.MaxY;
+}
+
+// Whether the segment (x0, y0) -> (x1, y1) intersects the closed rectangle.
+// Uses the separating axis theorem: the segment and the rectangle are
+// disjoint if and only if their bounding boxes are disjoint, or if the
+// 4 corners of the rectangle are strictly on the same side of the line
+// supporting the segment.
+RectIntersection SegmentIntersectsRectangle(double x0, double y0, double x1,
+                                            double y1, const OGREnvelope &sRect)
+{
+    // Written such that NaN coordinates do not lead to a NO answer.
+    if ((x0 < sRect.MinX && x1 < sRect.MinX) ||
+        (x0 > sRect.MaxX && x1 > sRect.MaxX) ||
+        (y0 < sRect.MinY && y1 < sRect.MinY) ||
+        (y0 > sRect.MaxY && y1 > sRect.MaxY))
+    {
+        return RectIntersection::NO;
+    }
+    if (IsPointInRectangle(x0, y0, sRect) || IsPointInRectangle(x1, y1, sRect))
+        return RectIntersection::YES;
+
+    const int nO1 = Orientation(x0, y0, x1, y1, sRect.MinX, sRect.MinY);
+    const int nO2 = Orientation(x0, y0, x1, y1, sRect.MaxX, sRect.MinY);
+    const int nO3 = Orientation(x0, y0, x1, y1, sRect.MaxX, sRect.MaxY);
+    const int nO4 = Orientation(x0, y0, x1, y1, sRect.MinX, sRect.MaxY);
+    if (nO1 == 0 || nO2 == 0 || nO3 == 0 || nO4 == 0)
+        return RectIntersection::UNKNOWN;
+    if (nO1 == nO2 && nO1 == nO3 && nO1 == nO4)
+        return RectIntersection::NO;
+    return RectIntersection::YES;
+}
+
+// Checks the segments of a point sequence against the rectangle, and if
+// pnCrossings is not null, considers the sequence as a polygon ring and
+// counts its crossings with the ray going from the center of the rectangle
+// towards +X.
+RectIntersection PointSequenceIntersectsRectangle(const OGRSimpleCurve *poLS,
+                                                  const OGREnvelope &sRect,
+                                                  int *pnCrossings)
+{
+    const int nNumPoints = poLS->getNumPoints();
+    if (nNumPoints == 0)
+        return RectIntersection::NO;
+
+    double x0 = poLS->getX(0);
+    double y0 = poLS->getY(0);
+    if (pnCrossings &&
+        (x0 != poLS->getX(nNumPoints - 1) || y0 != poLS->getY(nNumPoints - 1)))
+    {
+        // Non-closed rings are invalid for GEOS: only accept the
+        // intersection if a vertex is inside the rectangle, and otherwise
+        // let GEOS decide.
+        for (int i = 0; i < nNumPoints; ++i)
+        {
+            if (IsPointInRectangle(poLS->getX(i), poLS->getY(i), sRect))
+                return RectIntersection::YES;
+        }
+        return RectIntersection::UNKNOWN;
+    }
+    if (IsPointInRectangle(x0, y0, sRect))
+        return RectIntersection::YES;
+
+    const double cx = sRect.MinX + (sRect.MaxX - sRect.MinX) / 2;
+    const double cy = sRect.MinY + (sRect.MaxY - sRect.MinY) / 2;
+    bool bUnknown = false;
+    for (int i = 1; i < nNumPoints; ++i)
+    {
+        const double x1 = poLS->getX(i);
+        const double y1 = poLS->getY(i);
+        if (x0 != x1 || y0 != y1)
+        {
+            const auto eRet = SegmentIntersectsRectangle(x0, y0, x1, y1, sRect);
+            if (eRet == RectIntersection::YES)
+                return eRet;
+            if (eRet == RectIntersection::UNKNOWN)
+            {
+                bUnknown = true;
+            }
+            else if (pnCrossings && ((y0 > cy) != (y1 > cy)))
+            {
+                // The segment crosses the horizontal line going through the
+                // center. Determine on which side of the center.
+                const int nOrientation = Orientation(x0, y0, x1, y1, cx, cy);
+                if (nOrientation == 0)
+                    bUnknown = true;
+                else if ((y1 > y0) == (nOrientation > 0))
+                    ++(*pnCrossings);
+            }
+        }
+        x0 = x1;
+        y0 = y1;
+    }
+    return bUnknown ? RectIntersection::UNKNOWN : RectIntersection::NO;
+}
+
+// Computes whether the geometry intersects the closed rectangle, with the
+// same result as GEOS Intersects(), but without the cost of converting
+// the geometry to GEOS. Returns UNKNOWN for geometry types that are not
+// handled, and when rounding errors prevent a definitive answer.
+RectIntersection OGRGeometryIntersectsRectangle(const OGRGeometry *poGeometry,
+                                                const OGREnvelope &sRect)
+{
     switch (wkbFlatten(poGeometry->getGeometryType()))
     {
         case wkbPoint:
         {
             const auto poPoint = poGeometry->toPoint();
-            const double x = poPoint->getX();
-            const double y = poPoint->getY();
-            return (x >= sEnvelope.MinX && y >= sEnvelope.MinY &&
-                    x <= sEnvelope.MaxX && y <= sEnvelope.MaxY);
+            if (poPoint->IsEmpty())
+                return RectIntersection::NO;
+            return IsPointInRectangle(poPoint->getX(), poPoint->getY(), sRect)
+                       ? RectIntersection::YES
+                       : RectIntersection::NO;
         }
 
         case wkbLineString:
-            poLS = poGeometry->toLineString();
-            break;
+            return PointSequenceIntersectsRectangle(poGeometry->toLineString(),
+                                                    sRect, nullptr);
 
         case wkbPolygon:
         {
-            const OGRPolygon *poPoly = poGeometry->toPolygon();
-            poLS = poPoly->getExteriorRing();
-            break;
+            // If no ring intersects the rectangle, the rectangle is either
+            // fully inside or fully outside the polygon, which is determined
+            // by whether its center is inside the polygon (even-odd rule).
+            int nCrossings = 0;
+            bool bUnknown = false;
+            for (const auto *poRing : *(poGeometry->toPolygon()))
+            {
+                const auto eRet = PointSequenceIntersectsRectangle(
+                    poRing, sRect, &nCrossings);
+                if (eRet == RectIntersection::YES)
+                    return eRet;
+                if (eRet == RectIntersection::UNKNOWN)
+                    bUnknown = true;
+            }
+            if (bUnknown)
+                return RectIntersection::UNKNOWN;
+            return (nCrossings % 2) == 1 ? RectIntersection::YES
+                                         : RectIntersection::NO;
         }
 
         case wkbMultiPoint:
@@ -3960,35 +4110,26 @@ static bool DoesGeometryHavePointInEnvelope(const OGRGeometry *poGeometry,
         case wkbMultiPolygon:
         case wkbGeometryCollection:
         {
-            for (const auto &poSubGeom : *(poGeometry->toGeometryCollection()))
+            bool bUnknown = false;
+            for (const auto *poSubGeom : *(poGeometry->toGeometryCollection()))
             {
-                if (DoesGeometryHavePointInEnvelope(poSubGeom, sEnvelope))
-                    return true;
+                const auto eRet =
+                    OGRGeometryIntersectsRectangle(poSubGeom, sRect);
+                if (eRet == RectIntersection::YES)
+                    return eRet;
+                if (eRet == RectIntersection::UNKNOWN)
+                    bUnknown = true;
             }
-            return false;
+            return bUnknown ? RectIntersection::UNKNOWN : RectIntersection::NO;
         }
 
         default:
-            return false;
+            break;
     }
-
-    if (poLS != nullptr)
-    {
-        const int nNumPoints = poLS->getNumPoints();
-        for (int i = 0; i < nNumPoints; i++)
-        {
-            const double x = poLS->getX(i);
-            const double y = poLS->getY(i);
-            if (x >= sEnvelope.MinX && y >= sEnvelope.MinY &&
-                x <= sEnvelope.MaxX && y <= sEnvelope.MaxY)
-            {
-                return true;
-            }
-        }
-    }
-
-    return false;
+    return RectIntersection::UNKNOWN;
 }
+
+}  // namespace
 
 /************************************************************************/
 /*                           FilterGeometry()                           */
@@ -4042,13 +4183,14 @@ int OGRLayer::FilterGeometry(const OGRGeometry *poGeometry)
     }
     else
     {
-        // If the filter geometry is its own envelope and if the geometry has
-        // at least one point inside the filter geometry, the geometry itself
-        // intersects the filter geometry.
+        // If the filter geometry is its own envelope, try to determine
+        // the intersection without GEOS.
         if (m_bFilterIsEnvelope)
         {
-            if (DoesGeometryHavePointInEnvelope(poGeometry, m_sFilterEnvelope))
-                return true;
+            const auto eRet =
+                OGRGeometryIntersectsRectangle(poGeometry, m_sFilterEnvelope);
+            if (eRet != RectIntersection::UNKNOWN)
+                return eRet == RectIntersection::YES;
         }
 
         /* --------------------------------------------------------------------
@@ -4124,19 +4266,30 @@ bool OGRLayer::FilterWKBGeometry(const GByte *pabyWKB, size_t nWKBSize,
                 if (OGRGeometryFactory::createFromWkb(pabyWKB, nullptr, &poGeom,
                                                       nWKBSize) == OGRERR_NONE)
                 {
-                    if (!pPreparedFilterGeom)
+                    const auto eRet = bFilterIsEnvelope
+                                          ? OGRGeometryIntersectsRectangle(
+                                                poGeom, sFilterEnvelope)
+                                          : RectIntersection::UNKNOWN;
+                    if (eRet != RectIntersection::UNKNOWN)
                     {
-                        pPreparedFilterGeom =
-                            OGRCreatePreparedGeometry(OGRGeometry::ToHandle(
-                                const_cast<OGRGeometry *>(poFilterGeom)));
+                        ret = eRet == RectIntersection::YES;
                     }
-                    if (pPreparedFilterGeom)
-                        ret = OGRPreparedGeometryIntersects(
-                            pPreparedFilterGeom,
-                            OGRGeometry::ToHandle(
-                                const_cast<OGRGeometry *>(poGeom)));
                     else
-                        ret = poFilterGeom->Intersects(poGeom);
+                    {
+                        if (!pPreparedFilterGeom)
+                        {
+                            pPreparedFilterGeom =
+                                OGRCreatePreparedGeometry(OGRGeometry::ToHandle(
+                                    const_cast<OGRGeometry *>(poFilterGeom)));
+                        }
+                        if (pPreparedFilterGeom)
+                            ret = OGRPreparedGeometryIntersects(
+                                pPreparedFilterGeom,
+                                OGRGeometry::ToHandle(
+                                    const_cast<OGRGeometry *>(poGeom)));
+                        else
+                            ret = poFilterGeom->Intersects(poGeom);
+                    }
                 }
                 delete poGeom;
                 return CPL_TO_BOOL(ret);
