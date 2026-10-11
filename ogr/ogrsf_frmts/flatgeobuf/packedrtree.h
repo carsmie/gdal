@@ -71,6 +71,9 @@ struct SearchResultItem
 {
     uint64_t offset;
     uint64_t index;
+    // Feature size in bytes (size prefix included) when the next leaf item was
+    // read by the search, 0 when unknown
+    uint64_t size = 0;
 };
 
 std::ostream &operator<<(std::ostream &os, NodeItem const &value);
@@ -150,6 +153,13 @@ class PackedRTree
     static std::vector<SearchResultItem> streamSearch(
         const uint64_t numItems, const uint16_t nodeSize, const NodeItem &item,
         const std::function<void(uint8_t *, size_t, size_t)> &readNode);
+    // Same search, but all nodes of one tree level are fetched with a single
+    // readNodes(count, buffers, offsets, sizes) call so that a remote reader
+    // can issue them in parallel instead of one request per node.
+    static std::vector<SearchResultItem> streamSearch(
+        const uint64_t numItems, const uint16_t nodeSize, const NodeItem &item,
+        const std::function<void(size_t, uint8_t **, const size_t *,
+                                 const size_t *)> &readNodes);
     static std::vector<std::pair<uint64_t, uint64_t>>
     generateLevelBounds(const uint64_t numItems, const uint16_t nodeSize);
     uint64_t size() const;

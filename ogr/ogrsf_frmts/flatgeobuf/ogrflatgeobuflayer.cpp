@@ -936,22 +936,52 @@ OGRErr OGRFlatGeobufLayer::readIndex()
                          env.MinX, env.MinY, env.MaxX, env.MaxY);
             const vsi_l_offset treeOffset =
                 sizeof(magicbytes) + sizeof(uoffset_t) + headerSize;
-            const auto readNode =
-                [this, treeOffset](uint8_t *buf, size_t i, size_t s)
+            if (VSIHasOptimizedReadMultiRange(m_osFilename.c_str()) &&
+                CPLTestBool(
+                    CPLGetConfigOption("OGR_FLATGEOBUF_PARALLEL_READ", "YES")))
             {
-                if (VSIFSeekL(m_poFp, treeOffset + i, SEEK_SET) == -1)
-                    throw std::runtime_error("I/O seek failure");
-                if (VSIFReadL(buf, 1, s, m_poFp) != s)
-                    throw std::runtime_error("I/O read file");
-            };
-            m_foundItems = PackedRTree::streamSearch(
-                featuresCount, indexNodeSize, n, readNode);
+                // One parallel request per tree level instead of one
+                // sequential request per node
+                const auto readNodes =
+                    [this, treeOffset](size_t count, uint8_t **bufs,
+                                       const size_t *offsets,
+                                       const size_t *sizes)
+                {
+                    std::vector<vsi_l_offset> absOffsets(count);
+                    for (size_t k = 0; k < count; k++)
+                        absOffsets[k] = treeOffset + offsets[k];
+                    if (VSIFReadMultiRangeL(static_cast<int>(count),
+                                            reinterpret_cast<void **>(bufs),
+                                            absOffsets.data(), sizes,
+                                            m_poFp) != 0)
+                        throw std::runtime_error("I/O read file");
+                };
+                m_foundItems = PackedRTree::streamSearch(
+                    featuresCount, indexNodeSize, n, readNodes);
+            }
+            else
+            {
+                const auto readNode =
+                    [this, treeOffset](uint8_t *buf, size_t i, size_t s)
+                {
+                    if (VSIFSeekL(m_poFp, treeOffset + i, SEEK_SET) == -1)
+                        throw std::runtime_error("I/O seek failure");
+                    if (VSIFReadL(buf, 1, s, m_poFp) != s)
+                        throw std::runtime_error("I/O read file");
+                };
+                m_foundItems = PackedRTree::streamSearch(
+                    featuresCount, indexNodeSize, n, readNode);
+            }
             m_featuresCount = m_foundItems.size();
             CPLDebugOnly("FlatGeobuf",
                          "%lu features found in spatial index search",
                          static_cast<long unsigned int>(m_featuresCount));
 
             m_queriedSpatialIndex = true;
+            if (VSIHasOptimizedReadMultiRange(m_osFilename.c_str()) &&
+                CPLTestBool(
+                    CPLGetConfigOption("OGR_FLATGEOBUF_PARALLEL_READ", "YES")))
+                prefetchFoundFeatures();
         }
     }
     catch (const std::exception &e)
@@ -962,6 +992,125 @@ OGRErr OGRFlatGeobufLayer::readIndex()
     }
 
     return OGRERR_NONE;
+}
+
+void OGRFlatGeobufLayer::prefetchFoundFeatures()
+{
+    m_prefetched.clear();
+    m_prefetchIdx = 0;
+    if (m_foundItems.empty())
+        return;
+
+    // Found items come out of the leaf level in file order. Group them into
+    // clusters separated by more than maxGap unread bytes; a feature whose
+    // size is unknown (last item of a leaf node) gets the average known size,
+    // and parseFeature() falls back to a normal read if that was too short.
+    const uint64_t maxGap = std::strtoull(
+        CPLGetConfigOption("OGR_FLATGEOBUF_PREFETCH_MAX_GAP", "65536"),
+        nullptr, 10);
+    const uint64_t maxBytes = std::strtoull(
+        CPLGetConfigOption("OGR_FLATGEOBUF_PREFETCH_MAX_BYTES", "67108864"),
+        nullptr, 10);
+    uint64_t knownBytes = 0, knownCount = 0;
+    for (const auto &item : m_foundItems)
+    {
+        if (item.size)
+        {
+            knownBytes += item.size;
+            knownCount++;
+        }
+    }
+    const uint64_t estimate =
+        std::max<uint64_t>(knownCount ? knownBytes / knownCount : 0, 4096);
+    // an estimated range reaching past EOF would fail the whole multi-range read
+    if (m_nFileSize == 0)
+    {
+        VSIStatBufL sStatBuf;
+        if (VSIStatL(m_osFilename.c_str(), &sStatBuf) == 0)
+            m_nFileSize = sStatBuf.st_size;
+    }
+
+    std::vector<vsi_l_offset> offsets;
+    std::vector<size_t> sizes;
+    uint64_t total = 0;
+    for (const auto &item : m_foundItems)
+    {
+        const uint64_t start = m_offsetFeatures + item.offset;
+        uint64_t end = start + (item.size ? item.size : estimate);
+        if (m_nFileSize)
+            end = std::min<uint64_t>(end, m_nFileSize);
+        if (end <= start)
+            continue;
+        if (!offsets.empty() && start <= offsets.back() + sizes.back() + maxGap)
+        {
+            if (end > offsets.back() + sizes.back())
+            {
+                total += end - (offsets.back() + sizes.back());
+                sizes.back() = static_cast<size_t>(end - offsets.back());
+            }
+        }
+        else
+        {
+            offsets.push_back(start);
+            sizes.push_back(static_cast<size_t>(end - start));
+            total += end - start;
+        }
+        if (total > maxBytes)
+        {
+            // Too much to hold in memory: prefetch what fits, read the rest
+            // the usual way
+            offsets.pop_back();
+            sizes.pop_back();
+            break;
+        }
+    }
+    if (offsets.empty())
+        return;
+
+    try
+    {
+        m_prefetched.resize(offsets.size());
+        std::vector<void *> bufs(offsets.size());
+        for (size_t i = 0; i < offsets.size(); i++)
+        {
+            m_prefetched[i].offset = offsets[i];
+            m_prefetched[i].data.resize(sizes[i]);
+            bufs[i] = m_prefetched[i].data.data();
+        }
+        if (VSIFReadMultiRangeL(static_cast<int>(offsets.size()), bufs.data(),
+                                offsets.data(), sizes.data(), m_poFp) != 0)
+        {
+            // e.g. an estimated range past EOF: just read the usual way
+            CPLDebug("FlatGeobuf", "Feature prefetch failed, reading lazily");
+            m_prefetched.clear();
+        }
+    }
+    catch (const std::exception &)
+    {
+        m_prefetched.clear();
+    }
+    CPLDebugOnly("FlatGeobuf", "Prefetched %u feature range(s)",
+                 static_cast<unsigned>(m_prefetched.size()));
+}
+
+const GByte *OGRFlatGeobufLayer::prefetchedBytes(vsi_l_offset offset,
+                                                 size_t size)
+{
+    // Features are parsed in increasing offset order, so scan forward
+    while (m_prefetchIdx < m_prefetched.size())
+    {
+        const auto &range = m_prefetched[m_prefetchIdx];
+        if (offset < range.offset)
+            return nullptr;
+        if (offset < range.offset + range.data.size())
+        {
+            if (offset + size <= range.offset + range.data.size())
+                return range.data.data() + (offset - range.offset);
+            return nullptr;
+        }
+        m_prefetchIdx++;
+    }
+    return nullptr;
 }
 
 GIntBig OGRFlatGeobufLayer::GetFeatureCount(int bForce)
@@ -1084,18 +1233,28 @@ OGRErr OGRFlatGeobufLayer::parseFeature(OGRFeature *poFeature)
     if (m_featuresPos == 0)
         seek = true;
 
-    if (seek && VSIFSeekL(m_poFp, m_offset, SEEK_SET) == -1)
-    {
-        if (VSIFEofL(m_poFp))
-            return OGRERR_NONE;
-        return CPLErrorIO("seeking to feature location");
-    }
     uint32_t featureSize;
-    if (VSIFReadL(&featureSize, sizeof(featureSize), 1, m_poFp) != 1)
+    const GByte *prefetchedSize =
+        m_prefetched.empty() ? nullptr
+                             : prefetchedBytes(m_offset, sizeof(featureSize));
+    if (prefetchedSize)
     {
-        if (VSIFEofL(m_poFp))
-            return OGRERR_NONE;
-        return CPLErrorIO("reading feature size");
+        memcpy(&featureSize, prefetchedSize, sizeof(featureSize));
+    }
+    else
+    {
+        if (seek && VSIFSeekL(m_poFp, m_offset, SEEK_SET) == -1)
+        {
+            if (VSIFEofL(m_poFp))
+                return OGRERR_NONE;
+            return CPLErrorIO("seeking to feature location");
+        }
+        if (VSIFReadL(&featureSize, sizeof(featureSize), 1, m_poFp) != 1)
+        {
+            if (VSIFEofL(m_poFp))
+                return OGRERR_NONE;
+            return CPLErrorIO("reading feature size");
+        }
     }
     CPL_LSBPTR32(&featureSize);
 
@@ -1123,8 +1282,23 @@ OGRErr OGRFlatGeobufLayer::parseFeature(OGRFeature *poFeature)
     const auto err = ensureFeatureBuf(featureSize);
     if (err != OGRERR_NONE)
         return err;
-    if (VSIFReadL(m_featureBuf, 1, featureSize, m_poFp) != featureSize)
-        return CPLErrorIO("reading feature");
+    const GByte *prefetchedBody =
+        prefetchedSize
+            ? prefetchedBytes(m_offset + sizeof(featureSize), featureSize)
+            : nullptr;
+    if (prefetchedBody)
+    {
+        memcpy(m_featureBuf, prefetchedBody, featureSize);
+    }
+    else
+    {
+        // size came from the prefetch but the body is not (fully) in it
+        if (prefetchedSize &&
+            VSIFSeekL(m_poFp, m_offset + sizeof(featureSize), SEEK_SET) == -1)
+            return CPLErrorIO("seeking to feature location");
+        if (VSIFReadL(m_featureBuf, 1, featureSize, m_poFp) != featureSize)
+            return CPLErrorIO("reading feature");
+    }
     m_offset += featureSize + sizeof(featureSize);
 
     if (m_bVerifyBuffers)
@@ -2445,6 +2619,8 @@ void OGRFlatGeobufLayer::ResetReading()
     m_bEOF = false;
     m_featuresPos = 0;
     m_foundItems.clear();
+    m_prefetched.clear();
+    m_prefetchIdx = 0;
     m_featuresCount = m_poHeader ? m_poHeader->features_count() : 0;
     m_queriedSpatialIndex = false;
     m_ignoreSpatialFilter = false;

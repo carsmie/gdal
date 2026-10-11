@@ -406,6 +406,84 @@ std::vector<SearchResultItem> PackedRTree::streamSearch(
     return results;
 }
 
+std::vector<SearchResultItem> PackedRTree::streamSearch(
+    const uint64_t numItems, const uint16_t nodeSize, const NodeItem &item,
+    const std::function<void(size_t, uint8_t **, const size_t *,
+                             const size_t *)> &readNodes)
+{
+    auto levelBounds = generateLevelBounds(numItems, nodeSize);
+    const uint64_t leafNodesOffset = levelBounds.front().first;
+    const uint64_t numNodes = levelBounds.front().second;
+    std::vector<SearchResultItem> results;
+    // Node start indexes to visit on the current level, in increasing order.
+    // Parents always have lower indexes than their children, so finishing one
+    // level before the next keeps the traversal sequential in the file.
+    std::vector<uint64_t> levelNodes{0};
+    uint64_t level = levelBounds.size() - 1;
+    while (!levelNodes.empty())
+    {
+        const size_t count = levelNodes.size();
+        std::vector<NodeItem> items(count * nodeSize);
+        std::vector<uint8_t *> bufs(count);
+        std::vector<size_t> offsets(count), sizes(count), lengths(count);
+        for (size_t k = 0; k < count; k++)
+        {
+            const uint64_t nodeIndex = levelNodes[k];
+            const uint64_t end =
+                std::min(static_cast<uint64_t>(nodeIndex + nodeSize),
+                         levelBounds[static_cast<size_t>(level)].second);
+            lengths[k] = static_cast<size_t>(end - nodeIndex);
+            bufs[k] = reinterpret_cast<uint8_t *>(&items[k * nodeSize]);
+            offsets[k] = static_cast<size_t>(nodeIndex * sizeof(NodeItem));
+            sizes[k] = lengths[k] * sizeof(NodeItem);
+        }
+        readNodes(count, bufs.data(), offsets.data(), sizes.data());
+
+        std::vector<uint64_t> nextNodes;
+        for (size_t k = 0; k < count; k++)
+        {
+            const uint64_t nodeIndex = levelNodes[k];
+            const bool isLeafNode = nodeIndex >= numNodes - numItems;
+            NodeItem *nodeItems = &items[k * nodeSize];
+#if !CPL_IS_LSB
+            for (size_t i = 0; i < lengths[k]; i++)
+            {
+                CPL_LSBPTR64(&nodeItems[i].minX);
+                CPL_LSBPTR64(&nodeItems[i].minY);
+                CPL_LSBPTR64(&nodeItems[i].maxX);
+                CPL_LSBPTR64(&nodeItems[i].maxY);
+                CPL_LSBPTR64(&nodeItems[i].offset);
+            }
+#endif
+            for (size_t i = 0; i < lengths[k]; i++)
+            {
+                const auto &nodeItem = nodeItems[i];
+                if (!item.intersects(nodeItem))
+                    continue;
+                if (isLeafNode)
+                {
+                    // leaf items are in feature order, so the next item's
+                    // offset bounds this feature
+                    const uint64_t size =
+                        i + 1 < lengths[k]
+                            ? nodeItems[i + 1].offset - nodeItem.offset
+                            : 0;
+                    results.push_back(
+                        {nodeItem.offset, nodeIndex + i - leafNodesOffset, size});
+                }
+                else
+                    nextNodes.push_back(nodeItem.offset);
+            }
+        }
+        std::sort(nextNodes.begin(), nextNodes.end());
+        levelNodes = std::move(nextNodes);
+        if (level == 0)
+            break;
+        level--;
+    }
+    return results;
+}
+
 uint64_t PackedRTree::size() const
 {
     return _numNodes * sizeof(NodeItem);

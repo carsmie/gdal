@@ -93,6 +93,21 @@ class OGRFlatGeobufLayer final : public OGRLayer,
     std::vector<FlatGeobuf::SearchResultItem>
         m_foundItems;  // found node items in spatial index search
     bool m_queriedSpatialIndex = false;
+
+    // On filesystems with parallel multi-range reads (/vsicurl/, /vsigs/, ...)
+    // the features found by the index search are fetched up front as a few
+    // clusters in one parallel request, instead of one sequential request per
+    // cache miss while iterating. Offsets are absolute file offsets.
+    struct PrefetchedRange
+    {
+        vsi_l_offset offset = 0;
+        std::vector<GByte> data{};
+    };
+
+    std::vector<PrefetchedRange> m_prefetched{};
+    size_t m_prefetchIdx = 0;
+    void prefetchFoundFeatures();
+    const GByte *prefetchedBytes(vsi_l_offset offset, size_t size);
     bool m_ignoreSpatialFilter = false;
     bool m_ignoreAttributeFilter = false;
 
