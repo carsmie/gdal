@@ -31,6 +31,8 @@
 #endif
 
 #include <deque>
+#include <map>
+#include <memory>
 #include <limits>
 #include <utility>
 
@@ -102,12 +104,26 @@ class OGRFlatGeobufLayer final : public OGRLayer,
     {
         vsi_l_offset offset = 0;
         std::vector<GByte> data{};
+        uint64_t lastUse = 0;
     };
 
-    std::vector<PrefetchedRange> m_prefetched{};
+    std::vector<std::shared_ptr<PrefetchedRange>> m_prefetched{};
     size_t m_prefetchIdx = 0;
     void prefetchFoundFeatures();
     const GByte *prefetchedBytes(vsi_l_offset offset, size_t size);
+
+    // Multi-range reads bypass VSI_CACHE and the /vsicurl/ block cache, so the
+    // ranges they fetch are kept here (LRU, OGR_FLATGEOBUF_RANGE_CACHE_SIZE)
+    // to keep repeated queries over the same area as cheap as cached reads.
+    std::map<vsi_l_offset, std::shared_ptr<PrefetchedRange>> m_rangeCache{};
+    size_t m_rangeCacheBytes = 0;
+    uint64_t m_rangeCacheTick = 0;
+    std::shared_ptr<PrefetchedRange> cachedRange(vsi_l_offset offset,
+                                                 size_t size);
+    void cacheRange(const std::shared_ptr<PrefetchedRange> &range);
+    bool readRangesParallel(size_t count, const vsi_l_offset *offsets,
+                            const size_t *sizes,
+                            std::vector<std::shared_ptr<PrefetchedRange>> &out);
     bool m_ignoreSpatialFilter = false;
     bool m_ignoreAttributeFilter = false;
 

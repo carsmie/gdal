@@ -942,19 +942,42 @@ OGRErr OGRFlatGeobufLayer::readIndex()
             {
                 // One parallel request per tree level instead of one
                 // sequential request per node
+                // Few nodes (the top levels every query visits) go through the
+                // normal cached reads: multi-range reads bypass VSI_CACHE and the
+                // /vsicurl/ block cache, so they would be refetched each query.
+                const size_t minRanges = static_cast<size_t>(std::max(
+                    1, atoi(CPLGetConfigOption(
+                           "OGR_FLATGEOBUF_PARALLEL_MIN_RANGES", "4"))));
                 const auto readNodes =
-                    [this, treeOffset](size_t count, uint8_t **bufs,
-                                       const size_t *offsets,
-                                       const size_t *sizes)
+                    [this, treeOffset, minRanges](size_t count, uint8_t **bufs,
+                                                  const size_t *offsets,
+                                                  const size_t *sizes)
                 {
+                    if (count < minRanges)
+                    {
+                        for (size_t k = 0; k < count; k++)
+                        {
+                            if (VSIFSeekL(m_poFp, treeOffset + offsets[k],
+                                          SEEK_SET) == -1)
+                                throw std::runtime_error("I/O seek failure");
+                            if (VSIFReadL(bufs[k], 1, sizes[k], m_poFp) !=
+                                sizes[k])
+                                throw std::runtime_error("I/O read file");
+                        }
+                        return;
+                    }
                     std::vector<vsi_l_offset> absOffsets(count);
                     for (size_t k = 0; k < count; k++)
                         absOffsets[k] = treeOffset + offsets[k];
-                    if (VSIFReadMultiRangeL(static_cast<int>(count),
-                                            reinterpret_cast<void **>(bufs),
-                                            absOffsets.data(), sizes,
-                                            m_poFp) != 0)
+                    std::vector<std::shared_ptr<PrefetchedRange>> ranges;
+                    if (!readRangesParallel(count, absOffsets.data(), sizes,
+                                            ranges))
                         throw std::runtime_error("I/O read file");
+                    for (size_t k = 0; k < count; k++)
+                        memcpy(bufs[k],
+                               ranges[k]->data.data() +
+                                   (absOffsets[k] - ranges[k]->offset),
+                               sizes[k]);
                 };
                 m_foundItems = PackedRTree::streamSearch(
                     featuresCount, indexNodeSize, n, readNodes);
@@ -1064,33 +1087,112 @@ void OGRFlatGeobufLayer::prefetchFoundFeatures()
             break;
         }
     }
-    if (offsets.empty())
+    // One cluster gains nothing from a parallel fetch, and the normal reads
+    // keep using (and filling) the caches
+    if (offsets.size() < 2)
         return;
 
-    try
+    if (!readRangesParallel(offsets.size(), offsets.data(), sizes.data(),
+                            m_prefetched))
     {
-        m_prefetched.resize(offsets.size());
-        std::vector<void *> bufs(offsets.size());
-        for (size_t i = 0; i < offsets.size(); i++)
-        {
-            m_prefetched[i].offset = offsets[i];
-            m_prefetched[i].data.resize(sizes[i]);
-            bufs[i] = m_prefetched[i].data.data();
-        }
-        if (VSIFReadMultiRangeL(static_cast<int>(offsets.size()), bufs.data(),
-                                offsets.data(), sizes.data(), m_poFp) != 0)
-        {
-            // e.g. an estimated range past EOF: just read the usual way
-            CPLDebug("FlatGeobuf", "Feature prefetch failed, reading lazily");
-            m_prefetched.clear();
-        }
-    }
-    catch (const std::exception &)
-    {
+        // e.g. an estimated range past EOF: just read the usual way
+        CPLDebug("FlatGeobuf", "Feature prefetch failed, reading lazily");
         m_prefetched.clear();
     }
     CPLDebugOnly("FlatGeobuf", "Prefetched %u feature range(s)",
                  static_cast<unsigned>(m_prefetched.size()));
+}
+
+std::shared_ptr<OGRFlatGeobufLayer::PrefetchedRange>
+OGRFlatGeobufLayer::cachedRange(vsi_l_offset offset, size_t size)
+{
+    // Ranges may overlap, so look at a few entries starting at or before offset
+    auto it = m_rangeCache.upper_bound(offset);
+    for (int i = 0; i < 8 && it != m_rangeCache.begin(); i++)
+    {
+        --it;
+        const auto &range = it->second;
+        if (offset + size <= range->offset + range->data.size())
+        {
+            range->lastUse = ++m_rangeCacheTick;
+            return range;
+        }
+    }
+    return nullptr;
+}
+
+void OGRFlatGeobufLayer::cacheRange(const std::shared_ptr<PrefetchedRange> &range)
+{
+    static const size_t nMaxBytes = static_cast<size_t>(std::strtoull(
+        CPLGetConfigOption("OGR_FLATGEOBUF_RANGE_CACHE_SIZE", "33554432"),
+        nullptr, 10));
+    if (range->data.size() > nMaxBytes)
+        return;
+    range->lastUse = ++m_rangeCacheTick;
+    auto res = m_rangeCache.emplace(range->offset, range);
+    if (!res.second)
+    {
+        // same start offset: keep the longer range
+        if (res.first->second->data.size() >= range->data.size())
+            return;
+        m_rangeCacheBytes -= res.first->second->data.size();
+        res.first->second = range;
+    }
+    m_rangeCacheBytes += range->data.size();
+    while (m_rangeCacheBytes > nMaxBytes && !m_rangeCache.empty())
+    {
+        auto oldest = std::min_element(
+            m_rangeCache.begin(), m_rangeCache.end(),
+            [](const auto &a, const auto &b)
+            { return a.second->lastUse < b.second->lastUse; });
+        m_rangeCacheBytes -= oldest->second->data.size();
+        m_rangeCache.erase(oldest);
+    }
+}
+
+bool OGRFlatGeobufLayer::readRangesParallel(
+    size_t count, const vsi_l_offset *offsets, const size_t *sizes,
+    std::vector<std::shared_ptr<PrefetchedRange>> &out)
+{
+    // Serve what the range cache holds, fetch the rest in one parallel request
+    out.assign(count, nullptr);
+    std::vector<vsi_l_offset> missOffsets;
+    std::vector<size_t> missSizes, missIdx;
+    for (size_t i = 0; i < count; i++)
+    {
+        out[i] = cachedRange(offsets[i], sizes[i]);
+        if (!out[i])
+        {
+            missOffsets.push_back(offsets[i]);
+            missSizes.push_back(sizes[i]);
+            missIdx.push_back(i);
+        }
+    }
+    if (missIdx.empty())
+        return true;
+    try
+    {
+        std::vector<void *> bufs(missIdx.size());
+        for (size_t j = 0; j < missIdx.size(); j++)
+        {
+            auto range = std::make_shared<PrefetchedRange>();
+            range->offset = missOffsets[j];
+            range->data.resize(missSizes[j]);
+            bufs[j] = range->data.data();
+            out[missIdx[j]] = std::move(range);
+        }
+        if (VSIFReadMultiRangeL(static_cast<int>(missIdx.size()), bufs.data(),
+                                missOffsets.data(), missSizes.data(),
+                                m_poFp) != 0)
+            return false;
+    }
+    catch (const std::exception &)
+    {
+        return false;
+    }
+    for (size_t j : missIdx)
+        cacheRange(out[j]);
+    return true;
 }
 
 const GByte *OGRFlatGeobufLayer::prefetchedBytes(vsi_l_offset offset,
@@ -1099,7 +1201,7 @@ const GByte *OGRFlatGeobufLayer::prefetchedBytes(vsi_l_offset offset,
     // Features are parsed in increasing offset order, so scan forward
     while (m_prefetchIdx < m_prefetched.size())
     {
-        const auto &range = m_prefetched[m_prefetchIdx];
+        const auto &range = *m_prefetched[m_prefetchIdx];
         if (offset < range.offset)
             return nullptr;
         if (offset < range.offset + range.data.size())
